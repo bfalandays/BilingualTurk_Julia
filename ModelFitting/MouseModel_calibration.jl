@@ -1,9 +1,14 @@
-using Distributed
-addprocs(6; exeflags="--project")
+using Distributed; (need = 8 - nworkers()) > 0 && addprocs(need; exeflags="--project=$(dirname(Base.active_project()))"); atexit(() -> try rmprocs(workers()) catch end)
 
-# @everywhere 
-#include("/Users/jfalanda/Documents/Projects/Bilingual_Turk/BilingualTurk_Julia/src/BayesianModelFuncs.jl")
-@everywhere include("/Users/jfalanda/Documents/Projects/Bilingual_Turk/BilingualTurk_Julia/src/MouseModelFuncs.jl")
+@everywhere using BilingualTurk_Julia
+
+rawdata = DataFrame(CSV.File("../Exp2(lab)_forPub/Data/data.csv"))[:,:];
+summaryData = combine(groupby(rawdata, [:subject, :votstep, :language]), :choseP => sum => :Obs_P, nrow => :N)
+data = subject_to_idx(summaryData)
+df9 = rawdata[rawdata.votstep .== 9, :];
+# mtdata = DataFrame(CSV.File("../Exp2(lab)_forPub/Data/mtdata_preprocd_long.csv"))[:,2:12];
+
+# ========================================================================
 
 g(params) = optimFunc(df9, params)
 

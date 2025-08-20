@@ -1,14 +1,12 @@
-#SlurmClusterManager, 
-using DataFrames, Distributed, Distributions, StatsFuns,  JLD2, Plots, Random, StatsBase, LaTeXStrings, CSV, StatsPlots, ReverseDiff, LinearAlgebra, ParetoSmooth, KernelDensity, GaussianMixtures, Optim
+module MouseModelFuncs 
+# ================== START MODULE ==================
+export optimFunc,
+    simTrial_getMD
 
-## GLOBAL VARIABLES
+using Reexport
+@reexport using DataFrames, CSV, Distributed, Distributions, StatsFuns, Turing, ParetoSmooth, ReverseDiff, Plots, Random, LaTeXStrings, LinearAlgebra, GaussianMixtures, Optim, JLD2
+
 stimContinuum = collect(range(-20, 40, length=9));
-
-rawdata = DataFrame(CSV.File("../Exp2(lab)_forPub/Data/data.csv"))[:,:];
-# mtdata = DataFrame(CSV.File("../Exp2(lab)_forPub/Data/mtdata_preprocd_long.csv"))[:,2:12];
-# mtdata.angle = atan.(mtdata.ypos, mtdata.xpos) 
-# mtdata.deg = mtdata.angle * 180 / π
-df9 = rawdata[rawdata.votstep .== 9, :];
 
 ## DDM FIXED PARAMETERS
 pos_tl = (-1.0, 1.0)  # Top-left at (-1, 1)
@@ -320,6 +318,5 @@ function optimFunc(data, params)
     return -log_lik
 end
 
-
-
-
+# ================== END MODULE ==================
+end

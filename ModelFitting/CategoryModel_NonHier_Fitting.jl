@@ -1,7 +1,10 @@
-using Distributed
-addprocs(4; exeflags="--project")
+using Distributed; (need = 9 - nworkers()) > 0 && addprocs(need; exeflags="--project=$(dirname(Base.active_project()))"); atexit(() -> try rmprocs(workers()) catch end)
 
-@everywhere include("/Users/jfalanda/Documents/Projects/Bilingual_Turk/BilingualTurk_Julia/src/BayesianModelFuncs.jl")
+@everywhere using BilingualTurk_Julia
+rawdata = DataFrame(CSV.File("../Exp2(lab)_forPub/Data/data.csv"))[:,:];
+summaryData = combine(groupby(rawdata, [:subject, :votstep, :language]), :choseP => sum => :Obs_P, nrow => :N)
+
+# ========================================================================
 
 # Fitting for each subject
 subject_chains = Dict()
@@ -17,7 +20,7 @@ for subj in unique(summaryData.subject) #(14, 44) #
     count += 1
     println("Progress: ", round(count / length(unique(summaryData.subject)), digits=3), " ; Subject: ", subj)
 
-    # subj = 11
+    # subj = 25
     curdata = summaryData[summaryData.subject .== subj, :]
     lang = unique(curdata.language)[1]
 
@@ -25,7 +28,7 @@ for subj in unique(summaryData.subject) #(14, 44) #
     println("\tFitting 4 cat model...")
     
     mod_4cats = mod4cats(curdata)
-    initial_params=[rand(Xoshiro(i + 100),Vector, mod_4cats) for i in 1:nchains]
+    initial_params=[rand(Xoshiro(i + 100),Vector, mod_4cats) for i in 1:nchains];
     chn_4cats = sample(Xoshiro(0), mod_4cats, NUTS(), MCMCDistributed(), niter, nchains; nadapts=nwarmup, progress=true, initial_params=initial_params)
     # summarize(chn_4cats)
     # plot(chn_4cats)
@@ -38,6 +41,8 @@ for subj in unique(summaryData.subject) #(14, 44) #
     mod_2cats = mod2cats(curdata)
     initial_params=[rand(Xoshiro(i + 100),Vector, mod_2cats) for i in 1:nchains]
     chn_2cats = sample(Xoshiro(0), mod_2cats, NUTS(), MCMCDistributed(), niter, nchains; nadapts=nwarmup, progress=true, initial_params=initial_params)
+    p, _ = plotFit(chn_2cats, curdata, subj)
+    display(p)
 
     # ---- Plotting ---- #
     println("\t\tPlotting...")
