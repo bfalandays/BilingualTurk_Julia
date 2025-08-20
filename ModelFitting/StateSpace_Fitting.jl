@@ -19,17 +19,18 @@ if subsample
     mtdata = @chain mtdata @filter(subject in !!sampled_subjects)
 end
 mtdata = subject_to_idx(mtdata)
+mtdata.vot_norm = standardize(ZScoreTransform, mtdata.VOT)
 mtdata = @chain mtdata begin
-    @mutate(ang = atan.(ypos, xpos), vot_norm = (VOT + 20)/(60) * 2 - 1)
+    @mutate(ang = atan.(ypos, xpos)) #vot_norm = (VOT + 20)/(60) * 2 - 1)
     @mutate(G = case_when(language == "Monolingual English" => 1,
                           language == "Bilingual English" => 2,
                           language == "Bilingual Spanish" => 3))
-    @select(S, trial, G, votstep, ang, mt_seq)
+    @select(subject, S, trial, G, votstep, vot_norm, ang, mt_seq)
     @pivot_wider(names_from = mt_seq, values_from = ang)
 end
 S = mtdata.S
 G = mtdata.G
-V = mtdata.votstep
+V = mtdata.vot_norm
 y = Matrix{Float64}(mtdata[:, 5:end])
 
 # ======================================================================== 
@@ -48,26 +49,5 @@ notConv = chndf[chndf.rhat .> 1.01,:]
 
 #### 
 
-i = 3000
-sub = S[i]
-grp = G[i]
-β₀ = mean(chn_ssmod, "β₀[$grp]")
-u_vot = mean(chn_ssmod, "u_vot")
-ϵ = [mean(chn_ssmod, "ϵ[$sub, $n]") for n in 1:100]
-z = Array{Float64}(undef, 101)
-z[1] = mean(chn_ssmod, "z0[$sub]")
-for n in 2:101
-    z[n] = z[n-1] + ϵ[n-1]
-end
-plot(1:101, z)
-
-p = Array{Float64}(undef, 9, 101)
-i=0
-for vot in range(-1, 1, length=9)
-    i += 1
-    for n in 1:101
-        p[i, n] = logistic(β₀ + u_vot * vot + z[n])
-    end
-end
-plot(1:101, p[1,:], color=:red)
-plot!(1:101, p[9,:], color=:blue)
+S = 7
+plotSS(chn_ssmod, mtdata, S)
