@@ -1,7 +1,7 @@
 using Distributed; (need = 9 - nworkers()) > 0 && addprocs(need; exeflags="--project=$(dirname(Base.active_project()))"); atexit(() -> try rmprocs(workers()) catch end)
 
 @everywhere using BilingualTurk_Julia
-rawdata = DataFrame(CSV.File("../Exp2(lab)_forPub/Data/data.csv"))[:,:];
+rawdata = DataFrame(CSV.File("../Exp2/Data/data.csv"))[:,:];
 summaryData = combine(groupby(rawdata, [:subject, :votstep, :language]), :choseP => sum => :Obs_P, nrow => :N)
 
 # ========================================================================

@@ -109,7 +109,7 @@ end
 @model function mod2cats_hier(
     S::AbstractVector{<:Real}, # Subject index for each row of the data
     G::AbstractVector{<:Real}, # Group index for each subject
-    V::AbstractVector{<:Real}, # VOT step for each row of the data
+    V::AbstractVector{<:Real}, # VOT value for each row of the data
     N::AbstractVector{<:Real}, # Number of trials for each row of the data
     y::AbstractVector{<:Real}) # Observed proportions for each row of the data
 
@@ -167,7 +167,7 @@ end
 @model function mod4cats_hier(
     S::AbstractVector{<:Real}, # Subject index for each row of the data
     G::AbstractVector{<:Real}, # Group index for each subject
-    V::AbstractVector{<:Real}, # VOT step for each row of the data
+    V::AbstractVector{<:Real}, # VOT value for each row of the data
     N::AbstractVector{<:Real}, # Number of trials for each row of the data
     y::AbstractVector{<:Real}) # Observed proportions for each row of the data
 

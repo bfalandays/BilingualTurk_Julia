@@ -2,12 +2,12 @@ using Distributed; (need = 9 - nworkers()) > 0 && addprocs(need; exeflags="--pro
 using StatsPlots
 @everywhere using BilingualTurk_Julia
 
-rawdata = DataFrame(CSV.File("../Exp2(lab)_forPub/Data/data.csv"))[:,:];
-summaryData = combine(groupby(rawdata, [:subject, :votstep, :language]), :choseP => sum => :Obs_P, nrow => :N);
+rawdata = DataFrame(CSV.File("../Exp2/Data/data.csv"))[:,:];
+summaryData = combine(groupby(rawdata, [:subject, :VOT, :language]), :choseP => sum => :Obs_P, nrow => :N);
 data = subject_to_idx(summaryData);
 data = @chain data @mutate(G = case_when(language == "Monolingual English" => 1,language == "Bilingual English" => 2,language == "Bilingual Spanish" => 3))
 
-subsample = false
+subsample = true
 if subsample 
     println("Subsampling data for quicker testing")
     Random.seed!(1)
@@ -22,7 +22,7 @@ if subsample
     end
     data = @chain data begin 
         @filter(subject in !!sampled_subjects) 
-        @arrange(subject, votstep) 
+        @arrange(subject, VOT) 
         @aside idx = _.subject |> svec->[findfirst(==(s), unique(svec)) for s in svec]
         @mutate(S = !!idx)
         @aside idx = nothing
@@ -38,7 +38,7 @@ nwarmup = 5000;
 
 S = data.S
 G = [data.G[data.S .== s][1] for s in unique(S)]
-V = data.votstep
+V = data.VOT
 N = data.N
 y = data.Obs_P
 
