@@ -1,3 +1,12 @@
 {
-    
+  "terminal.integrated.profiles.osx": {
+    "Julia": {
+      "path": "/Applications/Julia-1.12.app/Contents/Resources/julia/bin/julia",
+      "args": ["--project=.", "--startup-file=yes"]
+    },
+    "zsh": {
+      "path": "/bin/zsh"
+    }
+  },
+  "terminal.integrated.defaultProfile.osx": "Julia"
 }

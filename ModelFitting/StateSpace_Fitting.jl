@@ -2,9 +2,12 @@ using Distributed; (need = 9 - nworkers()) > 0 && addprocs(need; exeflags="--pro
 using StatsPlots
 @everywhere using BilingualTurk_Julia
 
-mtdata = DataFrame(CSV.File("../Exp2/Data/mt_data_long.csv"))[:,:];
+#mtdata = DataFrame(CSV.File("../Exp2/Data/mt_data_long.csv"))[:,:];
 
-subsample = false
+mtdata = DataFrame(CSV.File("../Exp2/Data/ssm_data.csv"))[:,:];
+mtdata = @chain mtdata @rename(subject = sbj, mt_seq = timestep, xpos = x, ypos = y);
+
+subsample = true
 if subsample 
     println("Subsampling data for quicker testing")
     Random.seed!(1)
@@ -18,22 +21,22 @@ if subsample
         @pull(subject)
     end
     mtdata = @chain mtdata @filter(subject in !!sampled_subjects)
-    mtdata = subject_to_idx(mtdata)
 end
+mtdata = subject_to_idx(mtdata)
 
 #mtdata.vot_norm = standardize(ZScoreTransform, mtdata.VOT)
 mtdata = @chain mtdata begin
     @mutate(ang = atan.(ypos, xpos), vot_norm = (VOT + 20)/(60) * 2 - 1)
-    @mutate(G = case_when(language == "Monolingual English" => 1,
-                          language == "Bilingual English" => 2,
-                          language == "Bilingual Spanish" => 3))
+    @mutate(G = case_when(language == "Bilingual English" => 1,
+                          language == "Bilingual Spanish" => 2,
+                          language == "Monolingual English" => 3))
     @select(subject, S, trial, G, votstep, vot_norm, ang, mt_seq)
     @pivot_wider(names_from = mt_seq, values_from = ang)
 end
 S = mtdata.S
 G = mtdata.G
 V = mtdata.vot_norm
-y =  Matrix{Float64}(@chain mtdata @select(Symbol("1"):Symbol("101")))
+Y =  Matrix{Float64}(@chain mtdata @select(Symbol("1"):Symbol("101")))
 
 # ======================================================================== 
 
@@ -42,7 +45,7 @@ nchains = 4;
 niter = 2000;
 nwarmup = 2000;
 
-model = ssmod(S, G, V, y)
+model = ssmod_kalman(S, G, V, Y)
 # ppc = sample(model, Prior(), 100);# c = DataFrame(summarize(ppc)) # prior predictive check
 initial_params=[rand(Xoshiro(i+1),Vector, model) for i in 1:nchains];
 chn_ssmod = sample(model, MH(), MCMCDistributed(), niter, nchains; progress=true, initial_params=initial_params)

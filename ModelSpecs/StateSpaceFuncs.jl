@@ -1,9 +1,9 @@
 module StateSpaceFuncs 
 # ================== START MODULE ==================
-export ssmod, plotSS, getMAP, plotSubjMAP
+export ssmod, plotSS, getMAP, plotSubjMAP, ssmod_kalman
 
 using Reexport
-@reexport using DataFrames, TidierData, CSV, Random, StatsFuns, StatsBase, Distributed, Distributions, Turing, ParetoSmooth, ReverseDiff, Plots, LaTeXStrings, LinearAlgebra, JLD2
+@reexport using SplitApplyCombine, DataFrames, TidierData, CSV, Random, StatsFuns, StatsBase, Distributed, Distributions, Turing, ParetoSmooth, ReverseDiff, Plots, LaTeXStrings, LinearAlgebra, JLD2
 gr()
 
 # ---- HELPER FUNCS ---- #
@@ -27,21 +27,48 @@ end
 stimContinuum = collect(range(-20, 40, length=9));
 
 # ---------------------- #
-
-# "Exponential function scaled in the natural range of the concentration parameter (e.g. lb = 10, ub = 200)"
-function scale_exp(d; lb=10.0, ub=200.0)
-    raw = @. exp(d)
-    rmin, rmax = 1.0, exp(pi/4) 
-    κ = @. lb + (raw - rmin) * (ub - lb) / (rmax - rmin)
-    return κ
+function expꜛ(d::AbstractMatrix; lb::Real=10.0, ub::Real=200.0)
+    d¹ = exp.(d)
+    mins = minimum(d¹, dims=1); maxs = maximum(d¹, dims=1)
+    d² = lb .+ ((d¹ .- mins) ./ (maxs .- mins)) .* (ub - lb)
+    return sqrt.( 1 ./ d²)
 end
+
+#= π-scaled function. 
+    Following the code in the ssMousetrack R package, they set a lower bound of .1, and upper bound of π-.1 "to avoid the case y[n]~0". 
+    See ssMousetrack/R/run_ssm.R, line 76 and 86, where `bnds` is initialized.
+    Also see ssMousetrack/inst/stan/fit_model_log.stan, line 83 (logistic version)
+    or ssMousetrack/inst/stan/fit_model_gomp.stan, line 87 (gompertz version),
+    which is where the bounds are used.
+=#
+"""
+    𝒢(z, β; lb = .1, opt = :logistic)
+
+π-scaled link function.  
+`opt` can be:
+- `:logistic` (default):  π / (1 + exp(-β * z))
+- `:gompertz``:           π * exp(-β * exp(-z))
+"""
+function 𝒢(z::AbstractVector{<:Real}, β::AbstractVector{<:Real}; lb::Real=.1, opt::Symbol=:logistic)
+    ub = π - lb; R = ub - lb;
+    if opt == :logistic
+        return lb .+ R .* logistic.(β .- z)
+    elseif opt == :gompertz
+        return lb .+ ((ub - lb) .* exp.(-β .* exp.(-z)))
+    else
+        throw(ArgumentError("opt must be :logistic or :gompertz"))
+    end
+end
+
+const μᵣ = atan(1046, 778); # angle of right-side response option
+const μₗ = atan(1046, -778); # angle of left-side response option
 
 # STATE SPACE MODEL 
 @model function ssmod( 
-    S::AbstractVector{<:Real}, # S ϵ ℝᴶ ; S[j] indexes the subject for trial j
-    G::AbstractVector{<:Real}, # G ϵ ℝᴶ ; G[j] indexes the language group to which subject S[j] belongs
+    S::AbstractVector{<:Integer}, # S ϵ ℝᴶ ; S[j] indexes the subject for trial j
+    G::AbstractVector{<:Integer}, # G ϵ ℝᴶ ; G[j] indexes the language group to which subject S[j] belongs
     V::AbstractVector{<:Real}, # V ϵ ℝᴶ ; V[j] is the stimulus VOT value (scaled to -1:1) on trial j
-    y::AbstractMatrix{<:Real}) # y ϵ ℝᴶˣᴺ ; y[j, n] is the observed angle on trial j at timestep n
+    Y::AbstractMatrix{<:Real}) # y ϵ ℝᴶˣᴺ ; y[j, n] is the observed angle on trial j at timestep n
         #= NOTE:
             Because I filtered out trials with extreme response times, I don't have equal numbers of trials for each subject.
             As such, I can't format the data in a 3D array, so instead I have a 2D array where each row is a unique trial and 
@@ -50,48 +77,34 @@ end
 
     n_subjects = length(unique(S))
     n_groups = length(unique(G))
-    n_max = 101 # Each trial is time-normalized to 101 timesteps
     Gmat = indicatormat(G)'
-
-    μᵣ = atan(1046, 778); # angle of right-side response option
-    μₗ = atan(1046, -778); # angle of left-side response option
-    # κ = 200.0; # concentration parameter (not sure if it should be fixed here or set dynamically as in the likelihood loop below?)
 
     γₖ ~ MvNormal(zeros(n_groups), I)
     η ~ Normal();
     δₖ ~ MvNormal(zeros(n_groups), I)
     βⱼ = Gmat*γₖ + V*η + (V .* (Gmat * δₖ)) # β is a vector of coefficients for the logistic function, varying by group and VOT
 
-    zₛₙ = Array{Float64}(undef, n_subjects, n_max) # n_subjects x n_timesteps array to store latent variable z
-    for i in 1:n_subjects
-        zₛₙ[i, 1] ~ Normal(0, 1) # Prior for latent variable z at time 0
-        for n in 2:n_max
-            zₛₙ[i, n] ~ Normal(zₛₙ[i, n-1], 1) # AR(1) process for latent variable z
+    zₛₓₙ = Array{Float64}(undef, n_subjects, size(Y, 2)) # n_subjects x n_timesteps array to store latent variable z
+    for s in 1:n_subjects
+        zₛₓₙ[s, 1] ~ Normal(0, 1) # Prior for latent variable z at time 0
+        for n in 2:size(Y, 2)
+            zₛₓₙ[s, n] ~ Normal(zₛₓₙ[s, n-1], 1) # AR(1) process for latent variable z
         end
     end
 
-    # V1 
-    for j in 1:size(y, 1) # Outer loop over trials
-        for n in 2:n_max # Inner loop over timesteps
-            πⱼₙ = logistic(βⱼ[j] + zₛₙ[S[j],n]) # Compute mixing weight for right-side response option at time n
-            dⱼₙ = y[j, n] < pi/2 ? abs(y[j, n] - μᵣ) : abs(y[j, n] - μₗ) # Compute deviation from idealized trajectory at time n
-            κⱼₙ = scale_exp(dⱼₙ) # Compute concentration parameter κ at time n, based on deviation
-            y[j, n] ~ MixtureModel([VonMises(μᵣ, κⱼₙ), VonMises(μₗ, κⱼₙ)], [πⱼₙ, 1 - πⱼₙ]) # Define likelihood for observed data at time n
-        end
-    end
-    
-    # # ## V2 
-    # πⱼₙ = logistic.(βⱼ .+ zₛₙ[S, :]) # Compute mixing weight for right-side response option at each time step
-    # dⱼₙ = ifelse.(Matrix{Bool}(y .< pi/2), abs.(y .- μᵣ), abs.(y .- μₗ))
-    # κⱼₙ = scale_exp.(dⱼₙ)
-    # dists = map((a,b) -> [a,b], VonMises.(μᵣ, κⱼₙ), VonMises.(μₗ, κⱼₙ))
-    # weights = map((a,b) -> [a,b], πⱼₙ, 1 .- πⱼₙ)
-    # y ~ product_distribution(MixtureModel.(dists, weights)) # Define likelihood for observed data
-    # # for j in 1:size(y, 1)
-    # #     for n in 1:n_max
-    # #         y[j, n] ~ MixtureModel([VonMises(μᵣ, κⱼₙ[j, n]), VonMises(μₗ, κⱼₙ[j, n])], [πⱼₙ[j, n], 1 - πⱼₙ[j, n]])
-    # #     end
-    # # end
+    Dⱼₓₙ = @. ifelse(Y < π/2, abs(Y - μₗ), abs(Y - μᵣ)) # pre-compute the deviation from the far-side response option for all y
+    Κⱼₓₙ = expꜛ(Dⱼₓₙ) # pre-compute the concentration parameter for all y 
+    # for j in 1:size(y, 1) # Outer loop over trials
+    #     for n in axes(Y,2) # Inner loop over timesteps
+    #         μⱼₓₙ = 𝒢(zₛₓₙ[S[j], n], βⱼ) 
+    #         Y[j, n] ~ VonMises(μⱼₓₙ, κⱼₓₙ[j,n])
+    #     end
+    # end
+
+    for n in axes(Y,2) # Inner loop over timesteps
+        μⱼ = 𝒢(zₛₓₙ[S, n], βⱼ) 
+        Y[:, n] ~ arraydist(VonMises.(μⱼ, Κⱼₓₙ[:,n]))
+    end  
 end
 
 function getMAP(chndict, mtdata)
@@ -165,6 +178,80 @@ function plotSubjMAP(zₛₙ, πlogistic, mtdata, sidx)
 
     return fig
 end
+
+function subjmeans(Q::Vector{Float64}, S::Vector{Int})
+    @assert length(Q) == length(S)
+    K = maximum(S)
+    sums   = zeros(Float64, K)
+    counts = zeros(Int, K)
+    @inbounds @simd for i in eachindex(Q,S)
+        g = S[i]
+        sums[g]   += Q[i]
+        counts[g] += 1
+    end
+    sums ./ counts
+end
+# @btime tmp = subjmeans(Q₁, S) # 46.166 μs (6 allocations: 912 bytes)
+
+@model function ssmod_kalman(
+    S::AbstractVector{<:Integer},
+    G::AbstractVector{<:Integer},
+    V::AbstractVector{<:Real},
+    Y::AbstractMatrix{<:Real})
+
+    n_subjects = length(unique(S))
+    n_groups = length(unique(G))
+    Gmat = indicatormat(G)'
+
+    γₖ ~ MvNormal(zeros(n_groups), I) # γₖ = rand(MvNormal(zeros(n_groups), I))
+    η ~ Normal(); # η = rand(Normal())
+    δₖ ~ MvNormal(zeros(n_groups), I) # δₖ = rand(MvNormal(zeros(n_groups), I))
+    βⱼ = Gmat*γₖ + V*η + (V .* (Gmat * δₖ)) # β is a vector of coefficients for the logistic function, varying by group and VOT
+
+    ẑₛₓₙ = Array{Float64}(undef, n_subjects, size(Y, 2)); ẑₛₓₙ[:, 1] .= 1e-04; z̅ₛₓₙ = similar(ẑₛₓₙ); z̅ₛₓₙ[:, 1] .= 1e-04;
+    λ̂ₛₓₙ = Array{Float64}(undef, n_subjects, size(Y, 2)); λ̂ₛₓₙ[:, 1] .= 1.0; λ̅ₛₓₙ = similar(λ̂ₛₓₙ); λ̅ₛₓₙ[:, 1] .= 1.0;
+    ŷⱼₓₙ = Array{Float64}(undef, size(Y, 1), size(Y, 2));
+    σⱼₓₙ = Array{Float64}(undef, size(Y, 1), size(Y, 2));
+
+    Dⱼₓₙ = @. ifelse(Y < π/2, abs(Y - μₗ), abs(Y - μᵣ)) # pre-compute the deviation from the far-side response option for all y
+    Κⱼₓₙ = expꜛ(Dⱼₓₙ) # pre-compute the concentration parameter for all y 
+    for n in axes(Y,2)#1:size(y, 2) # Inner loop over timesteps κ
+        if n > 1
+            z̅ₛₓₙ[:, n] = ẑₛₓₙ[:, n-1]
+            λ̅ₛₓₙ[:, n] = λ̂ₛₓₙ[:, n-1] .+ 1.0
+        end
+        z̅ⱼ = z̅ₛₓₙ[S, n]
+        λ̅ⱼ = λ̅ₛₓₙ[S, n]
+
+        ŷⱼₓₙ[:,n] = 𝒢(z̅ⱼ, βⱼ)
+
+        σⱼₓₙ[:, n] = λ̅ⱼ + Κⱼₓₙ[:, n]
+
+        #= Benchmarking different ways to do the inference step
+            using BenchmarkTools
+            μ   = copy(ŷⱼₙ[:, n])
+            σ²  = copy(σⱼₙ[:, n])
+            σ   = sqrt.(σ²)
+            yv  = copy(y[:, n])
+            @btime sum(logpdf.(Normal.($μ, $σ), $yv)); # 62.167 μs (6 allocations: 128.16 KiB)
+            @btime logpdf(arraydist(Normal.($μ, $σ)), $yv); # 68.166 μs (3 allocations: 224.06 KiB)
+            @btime logpdf(MvNormal($μ, Diagonal($σ²)), $yv); # 66.375 μs (3 allocations: 128.06 KiB)
+        =#
+        Y[:,n] ~ MvNormal(ŷⱼₓₙ[:,n], Diagonal(σⱼₓₙ[:, n]))
+
+        Gₙ = λ̅ⱼ ./ σⱼₓₙ[:, n] # Kalman gain term
+        ẑₛₓₙ[:, n] = z̅ₛₓₙ[:, n] + subjmeans(((Y[:,n] .-  ŷⱼₓₙ[:,n]) .* Gₙ), S)
+        λ̂ₛₓₙ[:, n] = λ̅ₛₓₙ[:, n] - subjmeans((Gₙ .* σⱼₓₙ[:, n] .* Gₙ), S)
+        #=
+            @btime tmp = [mean(@view Q[S .== s]) for s in unique(S)] # 143.708 μs (285 allocations: 166.33 KiB)
+            @btime tmp2 = combine(groupby(DataFrame(S = S, Q = Q), :S), :Q => mean => :Δz)[!,:Δz] # 124.291 μs (320 allocations: 400.44 KiB)
+            @btime tmp4 = map(mean, SplitApplyCombine.group(S, Q)).values # 81.375 μs (212 allocations: 242.89 KiB)
+            @btime tmp5 = map(s -> mean(Q[S .== s]), unique(S)) #  136.459 μs (264 allocations: 165.27 KiB)
+        =#
+    end
+end
+
+
 
 # ================== END MODULE ==================
 end
