@@ -7,9 +7,10 @@ export mod2cats,
     plotFit,
     dviz,
     stimContinuum,
-    subject_to_idx,
     group_map,
-    lang_map
+    lang_map,
+    prepare_data_cat,
+    getChnDFs4plot
 
 using Reexport
 @reexport using DataFrames, TidierData, CSV, Random, StatsFuns, Distributed, Distributions, Turing, ParetoSmooth, ReverseDiff, Plots, LaTeXStrings, LinearAlgebra, JLD2
@@ -27,11 +28,51 @@ function dviz(d) # convenience function for visualizing distributions
     return mean(tmp), std(tmp)
 end
 
-function subject_to_idx(data)
-    d = Dict(s => i for (i, s) in enumerate(unique(data.subject)))
-    data.S = [d[s] for s in data.subject]
-    return data
+function subject_to_idx(df)
+    d = Dict(s => i for (i, s) in enumerate(unique(df.subject)))
+    df.S = [d[s] for s in df.subject]
+    return df
 end 
+
+function prepare_data_cat(df; subsample = false)
+    if subsample 
+        println("Subsampling 10 subjects from each group for quicker testing")
+        Random.seed!(1)
+        sampled_subjects = @chain df begin
+            @select(subject, lang_grp)
+            @distinct()
+            @group_by(lang_grp)
+            @slice_sample(n = 10, replace=false)
+            @ungroup()
+            @arrange(subject)
+            @pull(subject)
+        end
+        df = @chain df @filter(subject in !!sampled_subjects)
+    end;
+
+    df = @chain df @mutate(G = case_when(lang_grp == "BE" => 1, lang_grp == "BS" => 2, lang_grp == "ME" => 3))
+    Vstats = @chain df @group_by(G) @summarize(V̄ = mean(VOT), σV = std(VOT)) @arrange(G)
+    df = @chain df begin
+        @group_by(G)
+        @mutate(Vz  = (VOT .- mean(VOT)) ./ std(VOT))
+        @ungroup
+        @group_by(G, lang_grp, subject, VOT, Vz)
+        @summarize(Obs_P = sum(choseP), N = n())
+        @ungroup
+        @select(subject, lang_grp, G, VOT, Vz, Obs_P, N)
+        @arrange(G, subject, Vz)
+    end;
+
+    df = subject_to_idx(df)
+
+    S = df.S;
+    G = @chain df @group_by(S) @slice(1) @ungroup() @pull(G);
+    V = df.VOT;
+    N = df.N;
+    Y = df.Obs_P;
+    
+    return S, G, V, N, Y, df, Vstats
+end
 
 stimContinuum = collect(range(-20, 40, length=9));
 
@@ -74,8 +115,8 @@ end
 
 @model function mod4cats(data)
     # ---- Priors ---- #
-    logit_πₑ0 ~ Normal(logit(.8), 1)
-    πₑ := logistic(logit_πₑ0)
+    logit_w0 ~ Normal(logit(.8), 1)
+    w := logistic(logit_w0)
 
     μ ~ MvNormal([0.0, 40.0, -40.0, 0.0], 10^2 * I)
     bₑ_μ := μ[1]; pₑ_μ := μ[2]; bₛ_μ := μ[3]; pₛ_μ := μ[4]  # Mean of /p/ in Spanish
@@ -89,10 +130,10 @@ end
     # ---- Likelihood ---- #
     x = stimContinuum[data.votstep]
         
-    logπₑ = log(πₑ)
-    logπₛ = log(1 - πₑ)
-    logpdf_bₑ = logπₑ .+ logpdf.(Normal(bₑ_μ, bₑ_σ), x)
-    logpdf_pₑ = logπₑ .+ logpdf.(Normal(pₑ_μ, pₑ_σ), x)
+    logw = log(w)
+    logπₛ = log(1 - w)
+    logpdf_bₑ = logw .+ logpdf.(Normal(bₑ_μ, bₑ_σ), x)
+    logpdf_pₑ = logw .+ logpdf.(Normal(pₑ_μ, pₑ_σ), x)
     logpdf_bₛ = logπₛ .+ logpdf.(Normal(bₛ_μ, bₛ_σ), x)
     logpdf_pₛ = logπₛ .+ logpdf.(Normal(pₛ_μ, pₛ_σ), x)
     log_b = logsumexp(hcat(logpdf_bₑ, logpdf_bₛ), dims=2)[:, 1]
@@ -165,11 +206,11 @@ end
 end
 
 @model function mod4cats_hier(
-    S::AbstractVector{<:Real}, # Subject index for each row of the data
-    G::AbstractVector{<:Real}, # Group index for each subject
+    S::AbstractVector{<:Integer}, # Subject index for each row of the data
+    G::AbstractVector{<:Integer}, # Group index for each subject
     V::AbstractVector{<:Real}, # VOT value for each row of the data
-    N::AbstractVector{<:Real}, # Number of trials for each row of the data
-    y::AbstractVector{<:Real}) # Observed proportions for each row of the data
+    N::AbstractVector{<:Integer}, # Number of observations for each subject x VOT combination
+    Y::AbstractVector{<:Integer}) # Number of /p/ categorizations for each subject x VOT combination
 
     n_groups = length(unique(G))
     n_subjects = length(unique(S))
@@ -177,204 +218,121 @@ end
     # region ---- **** PRIORS **** ---- 
 
         # region -- *** MIXING WEIGHT *** --
-            logit_πₑ0 ~ Normal(logit(.8), 1)
-            πₑ0 := logistic(logit_πₑ0)
             # region -- ** GROUP LEVEL ** -- 
-                πₑ_τ_grp ~ truncated(Normal(0, .5); lower=0)
-                logit_πₑ_grp_z ~ MvNormal(zeros(n_groups), I) # logit_πₑ_grp_z ~ MvNormal(zeros(n_groups), I)
-                logit_πₑ_grp := logit_πₑ0 .+  πₑ_τ_grp .* logit_πₑ_grp_z #~ filldist(Normal(logit_πₑ0, πₑ_τ_grp), n_groups)
-                πₑ_grp := logistic.(logit_πₑ_grp)
+                logitw_grp ~ MvNormal(fill(logit(.8), n_groups), I)
+                w_grp := logistic.(logitw_grp)
             # end
                 # region -- * SUBJECT LEVEL * -- 
-                    πₑ_τ_sub ~ truncated(Normal(0,.5); lower=0) #filldist(truncated(Normal(0,.5); lower=0), n_groups) # between-subject variability of πₑ
-                    logit_πₑ_sub_z ~ MvNormal(zeros(n_subjects), I)
-                    logit_πₑ_sub := logit_πₑ_grp[G] .+ πₑ_τ_sub .* logit_πₑ_sub_z #~ MvNormal(logit_πₑ_grp[G], Diagonal(πₑ_τ_sub[G] .^ 2))  
-                    πₑ_sub := logistic.(logit_πₑ_sub)
+                    τw_sub ~ truncated(Normal(0,1); lower=0) 
+                    logitw_sub_z ~ MvNormal(zeros(n_subjects), I)
+                    logitw_sub := logitw_grp[G] .+ τw_sub .* logitw_sub_z  
+                    w_sub := logistic.(logitw_sub)
                 # end
         # end
 
         # region -- *** CATEGORY MEANS *** -- 
-            μ0 ~ MvNormal([0.0, 40.0, -40.0, 0.0], 5^2 * I)
+            bₑ0 ~ Normal(0.0, 10.0); bₛ0 ~ Normal(-40.0, 10.0)
+            logΔpₑ0 ~ Normal(log(40.0), 0.25); logΔpₛ0 ~ Normal(log(40.0), 0.25);
+            Δpₑ0 := exp(logΔpₑ0); Δpₛ0 := exp(logΔpₛ0);
+            pₑ0 := bₑ0 + Δpₑ0; pₛ0 := bₛ0 + Δpₛ0;
             # region -- ** GROUP LEVEL ** -- 
-                μ_τ_grp ~ filldist(truncated(Normal(0, 2.5); lower=0), 4)
-                μ_grp_z ~ filldist(MvNormal(zeros(4), I), n_groups) # filldist(MvNormal(μ0, Diagonal(μ_τ_grp .^ 2)), n_groups)
-                μ_grp := μ0 .+ μ_τ_grp .* μ_grp_z #~ filldist(MvNormal(μ0, Diagonal(μ_τ_grp .^ 2)), n_groups) # := μ0 .+ μ_τ_grp .* μ_grp_z                                  
-                bₑ_μ_grp := μ_grp[1,:]; pₑ_μ_grp := μ_grp[2,:]; bₛ_μ_grp := μ_grp[3,:]; pₛ_μ_grp := μ_grp[4,:]
+                τbₑ_grp ~ truncated(Normal(0, 7.5); lower=0) 
+                τbₛ_grp ~ truncated(Normal(0, 7.5); lower=0)
+                τlogΔpₑ_grp ~ truncated(Normal(0,0.2); lower=0)
+                τlogΔpₛ_grp ~ truncated(Normal(0,0.2); lower=0)
+                
+                bₑ_grp_z ~ MvNormal(zeros(n_groups), I)
+                bₛ_grp_z ~ MvNormal(zeros(n_groups), I)
+                logΔpₑ_grp_z ~ MvNormal(zeros(n_groups), I)
+                logΔpₛ_grp_z ~ MvNormal(zeros(n_groups), I)
+
+                bₑ_grp := bₑ0 .+ τbₑ_grp .* bₑ_grp_z
+                bₛ_grp := bₛ0 .+ τbₛ_grp .* bₛ_grp_z
+                logΔpₑ_grp := logΔpₑ0 .+ τlogΔpₑ_grp .* logΔpₑ_grp_z
+                logΔpₛ_grp := logΔpₛ0 .+ τlogΔpₛ_grp .* logΔpₛ_grp_z
+                Δpₑ_grp := exp.(logΔpₑ_grp); Δpₛ_grp := exp.(logΔpₛ_grp)
+                pₑ_grp := bₑ_grp .+ Δpₑ_grp; pₛ_grp := bₛ_grp .+ Δpₛ_grp
             # end
                 # region -- * SUBJECT LEVEL * -- 
-                    μ_τ_sub ~ filldist(truncated(Normal(0, 2.5), lower=0), 4)
-                    μ_sub_z ~ filldist(MvNormal(zeros(4), I), n_subjects)
-                    μ_sub := μ_grp[:, G] .+ μ_τ_sub .* μ_sub_z#~ arraydist([MvNormal(μ_grp[:, g], Diagonal(μ_τ_sub .^ 2)) for g in G])
-                    bₑ_μ_sub := μ_sub[1, :]; pₑ_μ_sub := μ_sub[2, :]; bₛ_μ_sub := μ_sub[3, :]; pₛ_μ_sub := μ_sub[4, :]
+                    τbₑ_sub ~ truncated(Normal(0, 7.5); lower=0) 
+                    τbₛ_sub ~ truncated(Normal(0, 7.5); lower=0)
+                    τlogΔpₑ_sub ~ truncated(Normal(0,0.2); lower=0)
+                    τlogΔpₛ_sub ~ truncated(Normal(0,0.2); lower=0)
+                    
+                    bₑ_sub_z ~ MvNormal(zeros(n_subjects), I)
+                    bₛ_sub_z ~ MvNormal(zeros(n_subjects), I)
+                    logΔpₑ_sub_z ~ MvNormal(zeros(n_subjects), I)
+                    logΔpₛ_sub_z ~ MvNormal(zeros(n_subjects), I)
+
+                    bₑ_sub := bₑ_grp[G] .+ τbₑ_sub .* bₑ_sub_z
+                    bₛ_sub := bₛ_grp[G] .+ τbₛ_sub .* bₛ_sub_z
+                    logΔpₑ_sub := logΔpₑ_grp[G] .+ τlogΔpₑ_sub .* logΔpₑ_sub_z
+                    logΔpₛ_sub := logΔpₛ_grp[G] .+ τlogΔpₛ_sub .* logΔpₛ_sub_z
+                    Δpₑ_sub := exp.(logΔpₑ_sub); Δpₛ_sub := exp.(logΔpₛ_sub)
+                    pₑ_sub := bₑ_sub .+ Δpₑ_sub; pₛ_sub := bₛ_sub .+ Δpₛ_sub
                 # end
         # end
 
         # region -- *** CATEGORY SDs *** -- 
-            σ0 ~ filldist(truncated(Normal(10.0, 2.5); lower =1), 4) #filldist(Gamma(m^2/v, v/m), 4)
+            logσ0 ~ filldist(Normal(log(10), .5), 4) 
             # region -- ** GROUP LEVEL ** -- 
-                σ_τ_grp ~ filldist(truncated(Normal(0, 1); lower=0), 4)#truncated(Normal(0, 1); lower=0)
-                σ_grp_z ~ filldist(MvNormal(zeros(4), I), n_groups)
-                σ_grp := softplus.(σ0 .+ σ_τ_grp .* σ_grp_z) .+ 1e-3 #softplus.(σ_cat .+ σ_τ_grp .* σ_grp_z) .+ 1e-3
-                bₑ_σ_grp := σ_grp[1, :]; pₑ_σ_grp := σ_grp[2, :]; bₛ_σ_grp := σ_grp[3, :]; pₛ_σ_grp := σ_grp[4, :]
+                τlogσ_grp ~ filldist(truncated(Normal(0, .4); lower=0.0), 4) 
+                logσ_grp_z ~ filldist(MvNormal(zeros(4), I), n_groups)
+                logσ_grp := logσ0 .+ τlogσ_grp .* logσ_grp_z
+                σ_grp := exp.(logσ_grp)
+                σbₑ_grp := σ_grp[1, :]; σpₑ_grp := σ_grp[2, :]; σbₛ_grp := σ_grp[3, :]; σpₛ_grp := σ_grp[4, :]
             # end
                 # region -- * SUBJECT LEVEL * -- 
-                    σ_τ_sub ~ filldist(truncated(Normal(0, 1); lower=0), 4) # log-scale subject SD
-                    σ_sub_z ~ filldist(MvNormal(zeros(4), I), n_subjects)
-                    σ_sub = softplus.(σ_grp[:, G] .+ σ_τ_sub .* σ_sub_z) .+ 1e-3    # 4 × n_subjects
-                    bₑ_σ_sub := σ_sub[1, :]; pₑ_σ_sub := σ_sub[2, :]; bₛ_σ_sub := σ_sub[3, :]; pₛ_σ_sub := σ_sub[4, :]
+                    τlogσ_sub ~ filldist(truncated(Normal(0, .3); lower=0.0), 4) # log-scale subject SD
+                    logσ_sub_z ~ filldist(MvNormal(zeros(4), I), n_subjects)
+                    logσ_sub := logσ_grp[:, G] .+ τlogσ_sub .* logσ_sub_z
+                    σ_sub := exp.(logσ_sub)
+                    σbₑ_sub := σ_sub[1, :]; σpₑ_sub := σ_sub[2, :]; σbₛ_sub := σ_sub[3, :]; σpₛ_sub := σ_sub[4, :]
                 # end
         # end
     # end
 
     # region ---- **** LIKELIHOOD **** ---- #
-        logπₑ = log.(πₑ_sub[S])
-        logπₛ = log.(1 .- πₑ_sub[S])
-        logpdf_bₑ = logπₑ .+ logpdf.(Normal.(bₑ_μ_sub[S], bₑ_σ_sub[S]), V)
-        logpdf_pₑ = logπₑ .+ logpdf.(Normal.(pₑ_μ_sub[S], pₑ_σ_sub[S]), V)
-        logpdf_bₛ = logπₛ .+ logpdf.(Normal.(bₛ_μ_sub[S], bₛ_σ_sub[S]), V)
-        logpdf_pₛ = logπₛ .+ logpdf.(Normal.(pₛ_μ_sub[S], pₛ_σ_sub[S]), V)
+        logwₑ = log.(w_sub[S])
+        logwₛ = log.(1 .- w_sub[S])
+        logpdf_bₑ = logwₑ .+ logpdf.(Normal.(bₑ_sub[S], σbₑ_sub[S]), V)
+        logpdf_pₑ = logwₑ .+ logpdf.(Normal.(pₑ_sub[S], σpₑ_sub[S]), V)
+        logpdf_bₛ = logwₛ .+ logpdf.(Normal.(bₛ_sub[S], σbₛ_sub[S]), V)
+        logpdf_pₛ = logwₛ .+ logpdf.(Normal.(pₛ_sub[S], σpₛ_sub[S]), V)
         log_b = logsumexp(hcat(logpdf_bₑ, logpdf_bₛ), dims=2)[:, 1]
         log_p = logsumexp(hcat(logpdf_pₑ, logpdf_pₛ), dims=2)[:, 1]
 
         prob_p = clamp.(logistic.(log_p .- log_b), 1e-12, 1 - 1e-12)
 
-        y ~ product_distribution(Binomial.(N, prob_p))
+        Y ~ product_distribution(Binomial.(N, prob_p))
         # for i in 1:nrow(data)
         #     data.Obs_P[i] ~ Binomial(data.N[i], prob_p[i])
         # end
     # end
 end
 
-@model function mod4cats_hier_reg(data)
-    n_groups = length(unique(data.language))
-    n_subjects = length(unique(data.subject))
-    g_subj = [group_map[data.language[data.subject .== s][1]] for s in unique(data.subject)]
-
-    # region ---- ** PRIORS ** ---- 
-        # region -- * MIXING WEIGHT * --
-                # GRAND INTERCEPT
-                β₀_logitπ ~ Normal(logit(4/5), 1.0) 
-
-                # GROUP EFFECTS
-                βⱼ_logitπ_raw ~ filldist(Normal(), n_groups)
-                βⱼ_logitπ = βⱼ_logitπ_raw .- mean(βⱼ_logitπ_raw)
-                logit_πⱼ = β₀_logitπ .+ βⱼ_logitπ
-                πⱼ := logistic.(logit_πⱼ)
-
-                # SUBJECT RANDOM INTERCEPTS
-                τ_logitπ_i ~ truncated(Normal(0, 0.5); lower=0)
-                zᵢ_logitπ ~ filldist(Normal(), n_subjects)
-                uᵢ_logitπ = τ_logitπ_i .* zᵢ_logitπ
-
-                logit_πᵢ = β₀_logitπ .+ βⱼ_logitπ[g_subj] .+ uᵢ_logitπ
-                πᵢ := logistic.(logit_πᵢ)
-        # end
-
-        # region -- * CATEGORY MEANS * -- 
-                # GRAND INTERCEPT
-                β₀_μ ~ MvNormal([0.0, 40.0, -40.0, 0.0], 5^2 * I)
-
-                # GROUP LEVEL
-                τ_μ_j ~ filldist(truncated(Normal(0, 5); lower=0), 4)      # per-category between-group SD
-                zⱼ_μ  ~ filldist(Normal(), 4, n_groups)                # 4 × n_groups standard normals
-                βⱼ_μ_raw = τ_μ_j .* zⱼ_μ
-                βⱼ_μ = βⱼ_μ_raw .- mean(βⱼ_μ_raw, dims=2)                  # enforce Σ_g βⱼ_μ[:,g] = 0
-                μⱼ = β₀_μ .+ βⱼ_μ 
-
-                # SUBJECT LEVEL
-                τ_μ_i ~ filldist(truncated(Normal(0, 0.5); lower=0), 4)
-                zᵢ_μ ~ filldist(MvNormal(zeros(4), I), n_subjects)
-                uᵢ_μ = τ_μ_i .* zᵢ_μ
-                μᵢ = β₀_μ .+ βⱼ_μ[:, g_subj] .+ uᵢ_μ
-
-                # Expose group means 
-                bₑ_μ_grp := μⱼ[1,:]; pₑ_μ_grp := μⱼ[2,:]; bₛ_μ_grp := μⱼ[3,:]; pₛ_μ_grp := μⱼ[4,:]
-                # Expose subject means 
-                bₑ_μ_sub := μᵢ[1,:]; pₑ_μ_sub := μᵢ[2,:]; bₛ_μ_sub := μᵢ[3,:]; pₛ_μ_sub := μᵢ[4,:]
-        # end
-
-        # region -- * CATEGORY SDs * -- 
-            # GRAND INTERCEPT
-            β₀_logσ ~ MvNormal(fill(log(5.0), 4), 0.3^2 * I)
-
-            # GROUP LEVEL
-            τ_logσ_j ~ filldist(truncated(Normal(0, 0.10); lower=0), 4)    # between-group SD per category on log scale
-            zⱼ_logσ  ~ filldist(Normal(), (4, n_groups))                   # 4 × n_groups
-            βⱼ_logσ_raw = τ_logσ_j .* zⱼ_logσ
-            βⱼ_logσ = βⱼ_logσ_raw .- mean(βⱼ_logσ_raw, dims=2)             # Σ_g βⱼ_logσ[:,g] = 0
-            logσⱼ = β₀_logσ .+ βⱼ_logσ 
-            σⱼ = exp.(logσⱼ)
-
-            # SUBJECT LEVEL
-            τ_logσ_i ~ filldist(truncated(Normal(0, 0.10); lower=0), 4)     # between-subject SD per category
-            zᵢ_logσ  ~ filldist(Normal(), (4, n_subjects))                  # 4 × n_subjects
-            uᵢ_logσ = τ_logσ_i .* zᵢ_logσ                                   # subject deviations (mean 0)
-
-            logσᵢ = β₀_logσ .+ βⱼ_logσ[:, g_subj] .+ uᵢ_logσ
-            σᵢ = exp.(logσᵢ)
-
-            # Expose group SDs
-            bₑ_σ_grp := σⱼ[1,:]; pₑ_σ_grp := σⱼ[2,:]; bₛ_σ_grp := σⱼ[3,:]; pₛ_σ_grp := σⱼ[4,:]
-            # Expose subject SDs
-            bₑ_σ_sub := σᵢ[1,:]; pₑ_σ_sub := σᵢ[2,:]; bₛ_σ_sub := σᵢ[3,:]; pₛ_σ_sub := σᵢ[4,:]
-        # end
-    # end
-
-    # region ---- ** LIKELIHOOD ** ---- #
-        x = stimContinuum[data.votstep]
-
-        logpdfs_p = hcat(
-            [log(πᵢ[s]) + logpdf(Normal(pₑ_μ_sub[s], pₑ_σ_sub[s]), x[i]) for (i, s) in enumerate(data.subj_idx)],
-            [log(1 - πᵢ[s]) + logpdf(Normal(pₛ_μ_sub[s], pₛ_σ_sub[s]), x[i]) for (i, s) in enumerate(data.subj_idx)]
-        )
-        log_p = logsumexp(logpdfs_p, dims=2)[:, 1]  # dims=2: across columns for each row
-        
-        logpdfs_b = hcat(
-            [log(πᵢ[s]) + logpdf(Normal(bₑ_μ_sub[s], bₑ_σ_sub[s]), x[i]) for (i, s) in enumerate(data.subj_idx)],
-            [log(1 - πᵢ[s]) + logpdf(Normal(bₛ_μ_sub[s], bₛ_σ_sub[s]), x[i]) for (i, s) in enumerate(data.subj_idx)]
-        )
-        log_b = logsumexp(logpdfs_b, dims=2)[:, 1]  # dims=2: across columns for each row
-
-        prob_p = clamp.(1.0 ./ (1 .+ exp.(log_b .- log_p)), 1e-12, 1 - 1e-12)
-        
-        data.Obs_P ~ product_distribution(Binomial.(data.N, prob_p))
-    # end
-end
-
 ## Model comparison funcs
 function pointwise_loglik(chain, data, stimContinuum)
-    version = (Symbol("πₑ_grp") in names(chain, :parameters) || Symbol("πₑ_grp[1]") in names(chain, :parameters) || Symbol("πₑ") in names(chain, :parameters)) ? "4cat" : "2cat"
+    version = (Symbol("w_grp") in names(chain, :parameters) || Symbol("w_grp[1]") in names(chain, :parameters) || Symbol("w") in names(chain, :parameters)) ? "4cat" : "2cat"
 
     idxs = data.subj_idx
     if version == "4cat"
-        if Symbol("bₑ_μ_sub[1]") in names(chain, :parameters)
-            πₑ = permutedims(cat([chain["πₑ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2))#;
-            bₑ_μ = permutedims(cat([chain["bₑ_μ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
-            pₑ_μ = permutedims(cat([chain["pₑ_μ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
-            bₛ_μ = permutedims(cat([chain["bₛ_μ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
-            pₛ_μ = permutedims(cat([chain["pₛ_μ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
-            bₑ_σ = permutedims(cat([chain["bₑ_σ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
-            pₑ_σ = permutedims(cat([chain["pₑ_σ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
-            bₛ_σ = permutedims(cat([chain["bₛ_σ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
-            pₛ_σ = permutedims(cat([chain["pₛ_σ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
-        else
-            πₑ = permutedims(cat([chain["πₑ"].data for i in idxs]...; dims=3), (3,1,2));
-            bₑ_μ = permutedims(cat([chain["bₑ_μ"].data for i in idxs]...; dims=3), (3,1,2));
-            pₑ_μ = permutedims(cat([chain["pₑ_μ"].data for i in idxs]...; dims=3), (3,1,2));
-            bₛ_μ = permutedims(cat([chain["bₛ_μ"].data for i in idxs]...; dims=3), (3,1,2));
-            pₛ_μ = permutedims(cat([chain["pₛ_μ"].data for i in idxs]...; dims=3), (3,1,2));
-            bₑ_σ = permutedims(cat([chain["bₑ_σ"].data for i in idxs]...; dims=3), (3,1,2));
-            pₑ_σ = permutedims(cat([chain["pₑ_σ"].data for i in idxs]...; dims=3), (3,1,2));
-            bₛ_σ = permutedims(cat([chain["bₛ_σ"].data for i in idxs]...; dims=3), (3,1,2));
-            pₛ_σ = permutedims(cat([chain["pₛ_σ"].data for i in idxs]...; dims=3), (3,1,2));
-        end
+        w = permutedims(cat([chain["w_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2))#;
+        bₑ_μ = permutedims(cat([chain["bₑ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
+        pₑ_μ = permutedims(cat([chain["pₑ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
+        bₛ_μ = permutedims(cat([chain["bₛ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
+        pₛ_μ = permutedims(cat([chain["pₛ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
+        bₑ_σ = permutedims(cat([chain["σbₑ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
+        pₑ_σ = permutedims(cat([chain["σpₑ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
+        bₛ_σ = permutedims(cat([chain["σbₛ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
+        pₛ_σ = permutedims(cat([chain["σpₛ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
 
         x = stimContinuum[data.votstep]
 
-        logpdf_bₑ = log.(πₑ) .+ logpdf.(Normal.(bₑ_μ, bₑ_σ), x);
-        logpdf_pₑ = log.(πₑ) .+ logpdf.(Normal.(pₑ_μ, pₑ_σ), x);
-        logpdf_bₛ = log.(1 .- πₑ) .+ logpdf.(Normal.(bₛ_μ, bₛ_σ), x);
-        logpdf_pₛ = log.(1 .- πₑ) .+ logpdf.(Normal.(pₛ_μ, pₛ_σ), x);
+        logpdf_bₑ = log.(w) .+ logpdf.(Normal.(bₑ_μ, bₑ_σ), x);
+        logpdf_pₑ = log.(w) .+ logpdf.(Normal.(pₑ_μ, pₑ_σ), x);
+        logpdf_bₛ = log.(1 .- w) .+ logpdf.(Normal.(bₛ_μ, bₛ_σ), x);
+        logpdf_pₛ = log.(1 .- w) .+ logpdf.(Normal.(pₛ_μ, pₛ_σ), x);
 
         log_p = log.(exp.(logpdf_pₑ) .+ exp.(logpdf_pₛ));
         log_b = log.(exp.(logpdf_bₑ) .+ exp.(logpdf_bₛ));
@@ -382,17 +340,10 @@ function pointwise_loglik(chain, data, stimContinuum)
         logliks = logpdf.(Binomial.(data.N, prob_p), data.Obs_P)
 
     else
-        if Symbol("bₑ_μ_sub[1]") in names(chain, :parameters)
-            bₑ_μ = permutedims(cat([chain["bₑ_μ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
-            pₑ_μ = permutedims(cat([chain["pₑ_μ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
-            bₑ_σ = permutedims(cat([chain["bₑ_σ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
-            pₑ_σ = permutedims(cat([chain["pₑ_σ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
-        else
-            bₑ_μ = permutedims(cat([chain["bₑ_μ"].data for i in idxs]...; dims=3), (3,1,2));
-            pₑ_μ = permutedims(cat([chain["pₑ_μ"].data for i in idxs]...; dims=3), (3,1,2));
-            bₑ_σ = permutedims(cat([chain["bₑ_σ"].data for i in idxs]...; dims=3), (3,1,2));
-            pₑ_σ = permutedims(cat([chain["pₑ_σ"].data for i in idxs]...; dims=3), (3,1,2));
-        end
+        bₑ_μ = permutedims(cat([chain["bₑ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
+        pₑ_μ = permutedims(cat([chain["pₑ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
+        bₑ_σ = permutedims(cat([chain["σbₑ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
+        pₑ_σ = permutedims(cat([chain["σpₑ_sub[$i]"].data for i in idxs]...; dims=3), (3,1,2));
 
         x = stimContinuum[data.votstep]
 
@@ -421,20 +372,52 @@ function compute_waic(pll)
     return waic
 end
 
+function getChnDFs4plot(chn, df, Vstats)
+    chndf = DataFrame(summarize(chn))
+    subdf = @chain chndf begin
+        @filter(occursin(r"(_sub)", String(parameters)))
+        @filter(occursin(r"\[(\d+)\]$", String(parameters)))
+        @filter(!occursin(r"(logit)", String(parameters)))
+        @filter(!occursin(r"(_z)", String(parameters)))
+        @filter(!occursin(r"(τ)", String(parameters)))
+    end 
+    transform!(subdf, 
+        :parameters => ByRow(p -> begin
+            s = String(p)                           # convert Symbol → String
+            m = match(r"\[(\d+)\]$", s)             # find trailing [N]
+            m === nothing ? missing : parse(Int, m.captures[1])
+        end) => :S)
+    transform!(subdf, :parameters => ByRow(p -> replace(String(p), r"\[\d+\]$" => "")) => :param)
+    subdf = unstack(subdf, :S, :param, :mean)
+    GS = @chain df @select(G, S) @group_by(S) @slice(1) @ungroup
+    subdf = @left_join(GS, subdf, S)
+    # subdf = @left_join(subdf, Vstats, G)
+    # subdf = @chain subdf begin
+    #     @mutate(
+    #         bₑ_sub = bₑ_sub * σV + V̄, σbₑ_sub = σbₑ_sub * σV,
+    #         pₑ_sub = pₑ_sub * σV + V̄, σpₑ_sub = σpₑ_sub * σV,
+    #         bₛ_sub = bₛ_sub * σV + V̄, σbₛ_sub = σbₛ_sub * σV,
+    #         pₛ_sub = pₛ_sub * σV + V̄, σpₛ_sub = σpₛ_sub * σV
+    #     )
+    # end
+
+    return subdf
+end
+
 ## Plotting funcs
 function plotFit(chain, data, subj)
-    version = (Symbol("πₑ_grp") in names(chain, :parameters) || Symbol("πₑ_grp[1]") in names(chain, :parameters) || Symbol("πₑ") in names(chain, :parameters)) ? "4cat" : "2cat"
+    version = (Symbol("w_grp") in names(chain, :parameters) || Symbol("w_grp[1]") in names(chain, :parameters) || Symbol("w") in names(chain, :parameters)) ? "4cat" : "2cat"
     
     curdata = data[data.subject .== subj, :]
-    lang = lang_map[unique(curdata.language)[1]]
-    g = group_map[curdata.language[1]]
+    lang = lang_map[unique(curdata.lang_grp)[1]]
+    g = group_map[curdata.lang_grp[1]]
 
     x = stimContinuum[curdata.votstep]
     if version == "4cat"
         #append_idx = ifelse(Symbol("bₑ_μ_sub[1]") in names(chain, :parameters), "[$i]", "")
         if Symbol("bₑ_μ_sub[1]") in names(chain, :parameters)
             i = curdata.subj_idx[1]  # Use the first index to get the group
-            πₑ = mean(chain["πₑ_sub[$i]"])
+            w = mean(chain["w_sub[$i]"])
             bₑ_μ = mean(chain["bₑ_μ_sub[$i]"])
             pₑ_μ = mean(chain["pₑ_μ_sub[$i]"])
             bₛ_μ = mean(chain["bₛ_μ_sub[$i]"])
@@ -444,7 +427,7 @@ function plotFit(chain, data, subj)
             bₛ_σ = mean(chain["bₛ_σ_sub[$i]"])
             pₛ_σ = mean(chain["pₛ_σ_sub[$i]"])
         else
-            πₑ = mean(chain["πₑ"])
+            w = mean(chain["w"])
             bₑ_μ = mean(chain["bₑ_μ"])
             pₑ_μ = mean(chain["pₑ_μ"])
             bₛ_μ = mean(chain["bₛ_μ"])
@@ -455,10 +438,10 @@ function plotFit(chain, data, subj)
             pₛ_σ = mean(chain["pₛ_σ"])
         end
 
-        logπₑ = log(πₑ)
-        logπₛ = log(1 - πₑ)
-        logpdf_bₑ = logπₑ .+ logpdf.(Normal(bₑ_μ, bₑ_σ), x)
-        logpdf_pₑ = logπₑ .+ logpdf.(Normal(pₑ_μ, pₑ_σ), x)
+        logw = log(w)
+        logπₛ = log(1 - w)
+        logpdf_bₑ = logw .+ logpdf.(Normal(bₑ_μ, bₑ_σ), x)
+        logpdf_pₑ = logw .+ logpdf.(Normal(pₑ_μ, pₑ_σ), x)
         logpdf_bₛ = logπₛ .+ logpdf.(Normal(bₛ_μ, bₛ_σ), x)
         logpdf_pₛ = logπₛ .+ logpdf.(Normal(pₛ_μ, pₛ_σ), x)
         log_b = logsumexp(hcat(logpdf_bₑ, logpdf_bₛ), dims=2)[:, 1]
@@ -467,7 +450,7 @@ function plotFit(chain, data, subj)
     else
         if Symbol("bₑ_μ_sub[1]") in names(chain, :parameters)
             i = curdata.subj_idx[1]  # Use the first index to get the group
-            πₑ = 1.0
+            w = 1.0
             bₑ_μ = mean(chain["bₑ_μ_sub[$i]"])
             pₑ_μ = mean(chain["pₑ_μ_sub[$i]"])
             bₛ_μ = -65.0
@@ -477,7 +460,7 @@ function plotFit(chain, data, subj)
             bₛ_σ = 0
             pₛ_σ = 0
         else
-            πₑ = 1.0
+            w = 1.0
             bₑ_μ = mean(chain["bₑ_μ"])
             pₑ_μ = mean(chain["pₑ_μ"])
             bₛ_μ = -65.0
@@ -541,13 +524,13 @@ function plotFit(chain, data, subj)
           linewidth=1.5)
 
     ##
-    eng_b = pdf.(Normal(bₑ_μ, bₑ_σ), newStimContinuum) .* πₑ
-    eng_p = pdf.(Normal(pₑ_μ, pₑ_σ), newStimContinuum) .* πₑ
+    eng_b = pdf.(Normal(bₑ_μ, bₑ_σ), newStimContinuum) .* w
+    eng_p = pdf.(Normal(pₑ_μ, pₑ_σ), newStimContinuum) .* w
 
-    spn_b = pdf.(Normal(bₛ_μ, bₛ_σ), newStimContinuum) .* (1-πₑ)
-    spn_p = pdf.(Normal(pₛ_μ, pₛ_σ), newStimContinuum) .* (1-πₑ)
+    spn_b = pdf.(Normal(bₛ_μ, bₛ_σ), newStimContinuum) .* (1-w)
+    spn_p = pdf.(Normal(pₛ_μ, pₛ_σ), newStimContinuum) .* (1-w)
     
-    wt = round(πₑ, digits=2)
+    wt = round(w, digits=2)
     legtitle_txt = L"$ENG. Wt.$: $\textbf{%$wt}$"
 
     label_b_eng = L"\mathrm{/b/_{ENG}} \sim N(%$(Int(round(bₑ_μ))),%$(Int(round(bₑ_σ))))" #"Eng /b/; N($(Int(round(bₑ_μ))),$(Int(round(bₑ_σ))))"

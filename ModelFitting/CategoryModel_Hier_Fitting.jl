@@ -1,64 +1,50 @@
-using Distributed; (need = 9 - nworkers()) > 0 && addprocs(need; exeflags="--project=$(dirname(Base.active_project()))"); atexit(() -> try rmprocs(workers()) catch end)
+#using Distributed; (need = 9 - nworkers()) > 0 && addprocs(need; exeflags="--project=$(dirname(Base.active_project()))"); atexit(() -> try rmprocs(workers()) catch end)
 using StatsPlots
-@everywhere using BilingualTurk_Julia
-
-rawdata = DataFrame(CSV.File("../Exp2/Data/data.csv"))[:,:];
-summaryData = combine(groupby(rawdata, [:subject, :VOT, :language]), :choseP => sum => :Obs_P, nrow => :N);
-data = subject_to_idx(summaryData);
-data = @chain data @mutate(G = case_when(language == "Monolingual English" => 1,language == "Bilingual English" => 2,language == "Bilingual Spanish" => 3))
-
-subsample = true
-if subsample 
-    println("Subsampling data for quicker testing")
-    Random.seed!(1)
-    sampled_subjects = @chain data begin
-        @select(subject, language)
-        @distinct()
-        @group_by(language)
-        @slice_sample(n = 5, replace=false)
-        @ungroup()
-        @arrange(subject)
-        @pull(subject)
-    end
-    data = @chain data begin 
-        @filter(subject in !!sampled_subjects) 
-        @arrange(subject, VOT) 
-        @aside idx = _.subject |> svec->[findfirst(==(s), unique(svec)) for s in svec]
-        @mutate(S = !!idx)
-        @aside idx = nothing
-    end 
-end
-
+#@everywhere using BilingualTurk_Julia
+using BilingualTurk_Julia
 # ======================================================================== 
 
-# Parameters for the MCMC sampling
+# == PREPARING DATA == #
+df = DataFrame(CSV.File("../Exp2/Data/data.csv"))[:,:];
+S, G, V, N, Y, df, Vstats = prepare_data_cat(df; subsample = true)
+
+# == MCMC SAMPLER CONFIG == #
 nchains = 4;
-niter = 5000;
-nwarmup = 5000;
+niter = 1000;
+nwarmup = 500;
 
-S = data.S
-G = [data.G[data.S .== s][1] for s in unique(S)]
-V = data.VOT
-N = data.N
-y = data.Obs_P
-
-# ---- Fit the 4 category model ---- #
-model_4 = mod4cats_hier(S, G, V, N, y)
-# ppc = sample(model_4, Prior(), 1000); # c = DataFrame(summarize(ppc)) # prior predictive check
+# == SAMPLING: 4 CAT MODEL == #
+model_4 = mod4cats_hier(S, G, V, N, Y); # ppc = sample(model_4, Prior(), 100); # c = DataFrame(summarize(ppc)) # prior predictive check
 # histogram(ppc["bₑ_μ_sub[1]"]); histogram(ppc["πₑ_sub[1]"]); histogram(ppc["bₑ_σ_sub[1]"])
 initial_params=[rand(Xoshiro(i+1),Vector, model_4) for i in 1:nchains];
-chn_4cats = sample(Xoshiro(0), model_4, NUTS(nwarmup, .65; max_depth=10, adtype=AutoReverseDiff(;compile=true)), MCMCDistributed(), niter, nchains; progress=true, initial_params=initial_params)
-chndf_4 = DataFrame(summarize(chn_4cats))
-chndf_4 = @chain chndf_4 begin
-    @filter(!occursin(r"(logit)", String(parameters)))
-    @filter(!occursin(r"(_z)", String(parameters)))
-    @filter(!occursin(r"\[\s*-?\d+\s*,\s*-?\d+\s*\]$", String(parameters)))  # drop names ending with [A,B]
-end
+chn_4cats = sample(Xoshiro(0), model_4, NUTS(nwarmup, .65; adtype=AutoReverseDiff(;compile=true)), MCMCThreads(), niter, nchains; progress=true, initial_params=initial_params)
+
+chndf4_sub = getChnDFs4plot(chn_4cats, df, Vstats)
+
+chndf4_grp = @chain chndf4 @filter(!occursin(r"(sub)", String(parameters))) @filter(occursin(r"\[(\d+)\]$", String(parameters)))
+
+    # 
+    # 
+    # @filter(!occursin(r"(log)", String(parameters)))
+    # 
+    # @filter(!occursin(r"\[\s*-?\d+\s*,\s*-?\d+\s*\]$", String(parameters)))  # drop names ending with [A,B]
+
+transform!(chndf_4_sub, 
+    :parameters => ByRow(p -> begin
+        s = String(p)                           # convert Symbol → String
+        m = match(r"\[(\d+)\]$", s)             # find trailing [N]
+        m === nothing ? missing : parse(Int, m.captures[1])
+    end) => :S)
+transform!(chndf_4_sub,
+    :parameters => ByRow(p -> replace(String(p), r"\[\d+\]$" => "")) => :param)
+
+df4_sub_wide.G = G
+
 notConv_4 = chndf_4[chndf_4.rhat .> 1.01,:]
 @save joinpath(@__DIR__, "Saved","mod4cats_hier_chains.jld2") chn_4cats
 # chn_4cats = load(joinpath(@__DIR__, "Saved","mod4cats_hier_chains.jld2"), "chn_4cats")
 
-# ---- Fit the 2 category model ---- #
+# == SAMPLING: 2 CAT MODEL == #
 model_2 = mod2cats_hier(S, G, V, N, y)
 # ppc = sample(model_2, Prior(), 1000) # prior predictive check
 # histogram(ppc["bₑ_σ_sub[1]"])
@@ -74,8 +60,7 @@ notConv_2 = chndf_2[chndf_2.rhat .> 1.01,:]
 @save joinpath(@__DIR__, "Saved","mod2cats_hier_chains.jld2") chn_2cats
 # chn_2cats = load(joinpath(@__DIR__, "Saved","mod2cats_hier_chains.jld2"), "chn_2cats")
 
-# ---- Plotting the fits ---- #
-
+# == PLOTTING == #
 i=0
 # for subj in sampled_subjects #[3,5,10,14,52] #
 for subj in unique(data.subject)
