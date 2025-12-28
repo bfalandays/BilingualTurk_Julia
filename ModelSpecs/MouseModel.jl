@@ -1,5 +1,6 @@
-module MouseModelFuncs 
+module MouseModel 
 # ================== START MODULE ==================
+
 export mDDM,
     syntheticLogLik,
     optimFunc,
@@ -12,28 +13,45 @@ export mDDM,
     timeNormalize,
     plotTrial
     
-
 using Reexport
-@reexport using DataFrames, CSV, Distributed, Distributions, StatsFuns, Turing, ParetoSmooth, ReverseDiff, Plots, Random, LaTeXStrings, LinearAlgebra, GaussianMixtures, Optim, JLD2, Interpolations, KernelDensity
+@reexport using ..Common, Optim
+using LaTeXStrings, LinearAlgebra, GaussianMixtures, Interpolations, KernelDensity, Distributed
 
-stimContinuum::Vector{Float64} = collect(range(-20, 40, length=9));
-
-## DDM FIXED PARAMETERS
-pos_tl::Tuple{Float64, Float64} = (-778/1280, 1046/1440)#(-1.0, 1.0)  # Top-left at (-1, 1)
-pos_tr::Tuple{Float64, Float64} = (778/1280, 1046/1440)#(1.0, 1.0)   # Top-right at (1, 1)
-xmargin::Float64 = 150/1280
-ymargin::Float64 = 150/1440
+#= DDM FIXED PARAMETERS
+    # Screen setup #
+    starting position was always (0,48)
+    sound was played when boundary crossed y = 148
+    response options were centered at (-778, 1114) and (+822, 1114) and were 300 x 300 px
+=#
+pos_tl::Tuple{Float64, Float64} = (-800, 1114) #(-778/1280, 1046/1440)#(-1.0, 1.0)  # Top-left at (-1, 1)
+pos_tr::Tuple{Float64, Float64} = (800, 1114) #(778/1280, 1046/1440)#(1.0, 1.0)   # Top-right at (1, 1)
+xmargin::Float64 = 150.0#/1280
+ymargin::Float64 = 150.0#/1440
+x_start::Float64, y_start::Float64 = (0.0, 48.0)
+min_x::Float64, max_x::Float64 = (-1280, 1280)
+min_y::Float64, max_y::Float64 = (0, 1440)
 Δt::Float64 = 0.01  # Time step size in seconds (same as sampling rate in experiment)
 
-function simulate_trial(A::Float64, ε::Float64, Z_thresh::Float64=.8, β::Float64=5.0, k::Float64=5.0, cₖ::Float64=1.0; Δt::Float64=Δt, hit_x::Float64=0.0781, hit_y::Float64=0.0694, barrier_y::Float64=.0694)
+function simulate_trial(
+    A::Float64, 
+    ε::Float64, 
+    Z_thresh::Float64=.8, 
+    β::Float64=5.0, 
+    k::Float64=5.0, 
+    cₖ::Float64=1.0; 
+    Δt::Float64=Δt, 
+    hit_x::Float64=xmargin, hit_y::Float64=ymargin, barrier_y::Float64=148.0,
+    x_start::Float64=x_start, y_start::Float64=y_start, 
+    min_x::Float64=min_x,max_x::Float64=max_x,
+    min_y::Float64=min_y,max_y::Float64=max_y)
 
     max_tsteps = Int(ceil(5/Δt))
 
-    x = 0.0; y = 0.0
-    vx = 0.0; vy = 0.0
-    Z = 0.0
-    Zs = Vector{Float64}(undef, max_tsteps+1)
-    Zs[1] = Z
+    x = x_start; y = y_start;
+    vx = 0.0; vy = 0.0;
+    Z = 0.0;
+    Zs = Vector{Float64}(undef, max_tsteps+1);
+    Zs[1] = Z;
 
     c = cₖ * -2 * sqrt(k)
     sΔ = sqrt(Δt)
@@ -44,48 +62,60 @@ function simulate_trial(A::Float64, ε::Float64, Z_thresh::Float64=.8, β::Float
 
     tstep = 1
     stimTime = 0.0
+    crossedbarrier = false
     @inbounds @fastmath while tstep < max_tsteps
         tstep += 1
+        
+        if y >= barrier_y && !crossedbarrier
+            crossedbarrier = true
+        end
                 
         # DDM increment (inline)
-        if y >= barrier_y
-            # stimTime += Δt
+        if crossedbarrier
+            stimTime += Δt
             # input = (stimTime ≤ 1.5) ? A : 0.0
-            # Z += input*Δt + ε*sΔ*randn()
-
-            Z += A*Δt + ε*sΔ*randn()
+            input = A
+            Z += input*Δt + ε*sΔ*randn()
         else
             Z += ε*sΔ*randn()
         end
-        # Z = clamp(Z, -1.0, 1.0)
+        # Z = clamp(Z, -Z_thresh, Z_thresh)
         Zs[tstep] = Z;
 
         # logistic weight and accelerations
         wtr = 1.0 / (1.0 + exp(-β * Z))
         wtl = 1.0 - wtr
 
-        ax = ((c*vx - k*(x - pos_tl[1]))*wtl + (c*vx - k*(x - pos_tr[1]))*wtr)
-        ay = ((c*vy - k*(y - pos_tl[2]))*wtl + (c*vy - k*(y - pos_tr[2]))*wtr) 
+        ax = (c*vx - k*(x - pos_tl[1]))*wtl + (c*vx - k*(x - pos_tr[1]))*wtr
+        ay = (c*vy - k*(y - pos_tl[2]))*wtl + (c*vy - k*(y - pos_tr[2]))*wtr
 
         vx += ax * Δt #+ .02 * sqrt(Δt) * randn()
         vy += ay * Δt #+ .02 * sqrt(Δt) * randn()
-        x += vx * Δt; x = clamp(x, -1.0, 1.0)
-        y += vy * Δt; y = clamp(y, 0.0, 1.0)
+        x += vx * Δt; x = clamp(x, min_x, max_x)
+        y += vy * Δt; y = clamp(y, min_y, max_y)
 
         xs[tstep] = x; ys[tstep] = y
 
         # hit test vs boxes (early exit)
-        if (abs(Z) >= Z_thresh) && (tstep*Δt ≥ 0.25) && ((abs(pos_tl[1]-x) < hit_x && abs(pos_tl[2]-y) < hit_y) || (abs(pos_tr[1]-x) < hit_x && abs(pos_tr[2]-y) < hit_y))
+        inbox = ((abs(pos_tl[1]-x) < hit_x && abs(pos_tl[2]-y) < hit_y) || (abs(pos_tr[1]-x) < hit_x && abs(pos_tr[2]-y) < hit_y))
+        v = sqrt(vx^2 + vy^2)
+        if (abs(Z) >= Z_thresh) && (tstep*Δt ≥ 0.25) && inbox && v < 10.0
             break
         end
 
     end
 
-    if tstep >= max_tsteps
-        return nothing
+    if Z >= Z_thresh
+        choice = 1
+    else
+        choice = 0
     end
 
-    return view(xs, 1:tstep), view(ys, 1:tstep), view(Zs, 1:tstep)
+    # if tstep >= max_tsteps
+    #     return nothing
+    # end
+
+    return view(xs, 1:tstep), view(ys, 1:tstep), view(Zs, 1:tstep), choice
 end
 
 # Simulate one trial
@@ -104,8 +134,8 @@ function plotTrial(x, y, Z)
     cursor_plot=Plots.plot(
         x, y,
         seriestype=:scatter, 
-        xlims=(-1.0, 1.0), 
-        ylims=(0.0, 1.0), 
+        xlims=(min_x, max_x), 
+        ylims=(min_y, max_y), 
         legend=false, 
         aspect_ratio=:equal,
         title="Simulated Cursor Trajectory",
@@ -220,40 +250,38 @@ function getAllMeasures(x::AbstractVector{<:Real}, y::AbstractVector{<:Real}, m:
     return MD, AD, sampEn
 end
 
-function simTrial_getMeasures(A::Float64; μₑ::Float64=0.698, σₑ::Float64=0.449, Z_thresh::Float64=1.0, k::Float64=59.75, cₖ::Float64=0.61, m::Int64=3, r::Float64=0.0, out::String="all")
-
-    ε = rand(truncated(Normal(μₑ,σₑ);lower=0, upper=2.0))
+function simTrial_getMeasures(A::Float64; ε::Float64=1.0, Z_thresh::Float64=2.0, β::Float64=5.0, k::Float64=59.75, cₖ::Float64=0.61, m::Int64=3, r::Float64=0.0, out::String="all")
     
-    x, y, Z = simulate_trial(A, ε, Z_thresh, k, cₖ)
+    x, y, Z, choice = simulate_trial(A, ε, Z_thresh, β, k, cₖ)
     
     #x, y = timeNormalize(x, y)
 
     if out == "all"
         MD, AD, sampEn = getAllMeasures(x, y, m, r)
-        return MD, AD, sampEn
+        return MD, AD, sampEn, choice
     elseif out=="devs"
         MD, AD = getDevMeasures(x, y; out="both")
-        return MD, AD
+        return MD, AD, choice
     elseif out == "MD" || out == "AD"
         XD = getDevMeasures(x, y; out=out)
-        return XD
+        return XD, choice
     elseif out == "sampEn"
         sampEn = getSampEn(x, y, m, r)
-        return sampEn
+        return sampEn, choice
     end
 end
 
 #= test plotting
-    @time x, y, Z = simulate_trial(
-        -.2, # A
+    x, y, Z, choice = simulate_trial(
+        1.0, # A
         1.0, # ε (noise magnitude)
-        1.0, # Z threshold for decision
-        3.5, # β (logistic slope for weight as a function of Z)
-        25.0, # k
-        .61
+        2.0, # Z threshold for decision
+        3.25, # β (logistic slope for weight as a function of Z)
+        158.0, # k 
+        .51 # # cₖ
         );
     combined_plot = plotTrial(x,y,Z)
-    #@time x, y = timeNormalize(x, y);
+    # x, y = timeNormalize(x, y);
     MD, AD, sampEn = getAllMeasures(x,y)
 =#
 
@@ -312,29 +340,32 @@ function catModel_1set(curparams)
     return prob_P, A
 end
 
+#=
+    humdata = data.MD₂
+    β, k, cₖ = 8.32, 443.62, 1.32
+    A = 1.0
+    sim_ys = pmap((trial) -> simTrial_getMeasures(A; β = β, k = k, cₖ = cₖ, out="MD"), 1:length(humdata));
+    density(humdata, xlims=(minimum(humdata), maximum(humdata)))
+    density!(sim_ys, xlims=(minimum(humdata), maximum(humdata)))
+=#
+
 function optimFunc(data, params) 
-    μₑ, σₑ, k, cₖ, Aₖ = params
+    β, k, cₖ = params
 
     humdata = data.MD₂
-    # bw = 1.06 * std(humdata) * length(humdata)^(-1/5)
-
-    # σ, σ_τ, k, cₖ = [0.698, 0.449, 59.75, 0.61]
-    A = 1.0
-    sim_ys = pmap((trial) -> simTrial_getMeasures(A*Aₖ; μₑ = μₑ, σₑ = σₑ, k = k, cₖ = cₖ, out="MD"), 1:length(humdata));
-
-    # kde_fit = kde(simdata, boundary=(minimum(humdata)-1.0, maximum(humdata)+1.0), bandwidth=bw)
-    # densities = pdf(kde_fit, humdata)
-    # clipped = clamp.(densities, 1e-6, Inf)  # eps() ≈ 2.22e-16
-    # log_lik = sum(log.(clipped))
-    # log_lik = sum(log.(pdf(kde_fit, humdata)))
-
-    # density(humdata, xlims=(minimum(humdata), maximum(humdata)))
-    # density!(simdata, xlims=(minimum(humdata), maximum(humdata)))
-    # y = pdf(kde_fit, 0.:.01:2.0) #collect(range(minimum(humdata), maximum(humdata), length(kde_fit.density)))
-    # plot!(0.0:.01:2.0,y)
+    B_ys_hum = humdata[data.choseP .== 0]; P_ys_hum = humdata[data.choseP .== 1];
     
-    gmm = MixtureModel(GMM(2,sim_ys));
-    loglik = loglikelihood(gmm, humdata)
+    # σ, σ_τ, k, cₖ = [0.698, 0.449, 59.75, 0.61]
+    A = 0.0
+    simdata = pmap((trial) -> simTrial_getMeasures(A; β = β, k = k, cₖ = cₖ, out="MD"), 1:length(humdata));
+    sim_ys = first.(simdata); sim_choices = last.(simdata); B_ys_sim = sim_ys[sim_choices .== 0]; P_ys_sim = sim_ys[sim_choices .== 1];
+
+    bw = 1.06 * std(humdata) * length(humdata)^(-1/5)
+    kde_fit = kde(sim_ys, boundary=(minimum(humdata)-1.0, maximum(humdata)+1.0), bandwidth=bw)
+    loglik = sum(log.(pdf(kde_fit, humdata)))
+    
+    # gmm = MixtureModel(GMM(2,sim_ys));
+    # loglik = loglikelihood(gmm, humdata)
 
     # d = fit(Gamma{Float64}, sim_ys)
     # loglik = loglikelihood(d, humdata)

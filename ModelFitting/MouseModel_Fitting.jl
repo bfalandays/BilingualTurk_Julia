@@ -1,6 +1,6 @@
-using Distributed; (need = 8 - nworkers()) > 0 && addprocs(need; exeflags="--project=$(dirname(Base.active_project()))"); atexit(() -> try rmprocs(workers()) catch end)
-
-@everywhere using BilingualTurk_Julia
+# using Distributed; (need = 8 - nworkers()) > 0 && addprocs(need; exeflags="--project=$(dirname(Base.active_project()))"); atexit(() -> try rmprocs(workers()) catch end)
+# @everywhere using BilingualTurk_Julia
+using BilingualTurk_Julia.MouseModel
 
 #= Data pre-processing -- saved result to not repeat
     rawdata = DataFrame(CSV.File("../Exp2/Data/data.csv"))[:,2:end];
@@ -60,7 +60,7 @@ nwarmup = 2000;
 
 model = mDDM(S, G, V, y)
 # ppc = sample(model, Prior(), 100); # c = DataFrame(summarize(ppc)) # prior predictive check
-initial_params=[rand(Xoshiro(i+1),Vector, model) for i in 1:nchains];
+initial_params= fill(InitFromPrior(), nchains) # initial_params=[rand(Xoshiro(i+1),Vector, model) for i in 1:nchains];
 chn_ssmod = sample(model, MH(), MCMCDistributed(), niter, nchains; progress=true, initial_params=initial_params)
 chndf = DataFrame(summarize(chn_ssmod))
 chndict = Dict(chndf.parameters .=> chndf.mean)

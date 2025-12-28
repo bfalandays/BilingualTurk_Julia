@@ -1,4 +1,4 @@
-module StateSpaceFuncs 
+module StateSpaceModel
 
 #= TO DO / TO THINK ABOUT:
     - Now that the state space model is working, how do I link it to the category model?
@@ -26,30 +26,21 @@ module StateSpaceFuncs
 =#
 
 # ================== START MODULE ==================
-export prepare_data, expꜛ, 𝒢, μᵣ, μₗ, ssmod, ssmod_kalman, zMAP_subj, plot_zMAP_subj 
+
+export prepare_data_SS, 
+    expꜛ, 
+    𝒢, 
+    μᵣ, 
+    μₗ, 
+    ssmod, 
+    plot_zMAP_subj 
 
 using Reexport
-@reexport using SplitApplyCombine, DataFrames, TidierData, CSV, Random, StatsFuns, StatsBase, Distributed, Distributions, Turing, ParetoSmooth, ReverseDiff, Plots, LaTeXStrings, LinearAlgebra, JLD2, SparseArrays
+@reexport using ..Common 
+using SplitApplyCombine, LaTeXStrings, LinearAlgebra, SparseArrays
 gr()
 
 # ---- HELPER FUNCS ---- #
-function dviz(d) # convenience function for visualizing distributions
-    tmp = rand(d,10000)
-    if typeof(d) <: Beta
-        display(histogram(tmp, xlims=(0,1)))
-    else
-        display(histogram(tmp))
-    end
-    
-    return mean(tmp), std(tmp)
-end
-
-function subject_to_idx(data)
-    d = Dict(s => i for (i, s) in enumerate(unique(data.subject)))
-    data.S = [d[s] for s in data.subject]
-    return data
-end 
-
 function prepare_data_SS(df; subsample = false)
     if subsample 
         println("Subsampling 10 subjects from each group for quicker testing")
@@ -84,7 +75,7 @@ function prepare_data_SS(df; subsample = false)
     end;
     S = df.S;
     G = df.G; 
-    V = df.vot_z;
+    V = df.VOT; #df.vot_z;
     Y =  Matrix{Float64}(@chain df @select(Symbol("1"):Symbol("101")));
     D = @. ifelse(Y < π/2, abs(Y - μₗ), abs(Y - μᵣ)); # pre-compute the deviation from the far-side response option for all y
     # D = @. ifelse(Y > π/2, abs(Y - μₗ), abs(Y - μᵣ)); # pre-compute the deviation from the far-side response option for all y
@@ -156,66 +147,11 @@ function 𝒢(
     end
 end
 
-const μᵣ = atan(1046, 778); # angle of right-side response option
-const μₗ = atan(1046, -778); # angle of left-side response option
+const μᵣ = atan(1114, 800); # angle of right-side response option
+const μₗ = atan(1114, -800); # angle of left-side response option
 const LOG2π = log(2π)
 
 # STATE SPACE MODEL 
-@model function ssmod_full( 
-    Sⱼ::AbstractVector{<:Integer}, # Length J, indexes the subject for trial j
-    Gⱼ::AbstractVector{<:Integer}, # Length J, indexes the language group of subject on trial j 
-    Vⱼ::AbstractVector{<:Real}, # Length J, the stimulus VOT value (scaled to -1:1) on trial j
-    Yⱼₓₙ::AbstractMatrix{<:Real}, # JxN, the observed angle on trial j at timestep n
-    Kⱼₓₙ::AbstractMatrix{<:Real}, # J×N, measurement VAR proxy (1/√Kappa)
-    I::Int, # number of subjects
-    N::Int, # number of timepoints
-    ::Type{T}=Float64) where {T} # ensuring types can be inferred
-
-    n_groups = maximum(Gⱼ)
-
-    γₖ ~ MvNormal(zeros(n_groups), .5I) # γₖ = rand(MvNormal(zeros(n_groups), I))
-    η ~ Normal(0, .5); # η = rand(Normal())
-    δₖ ~ MvNormal(zeros(n_groups), .5I) # δₖ = rand(MvNormal(zeros(n_groups), I))
-    βⱼ = @. γₖ[Gⱼ] + Vⱼ*η + (Vⱼ * δₖ[Gⱼ]) # β is a vector of coefficients for the logistic function, varying by group and VOT
-
-    #= β is a vector of coefficients for the logistic function, varying by group and VOT. 
-        When β > z -> μ = 𝒢(z, β) < pi/2, which means attraction towards the right side (currently mapped to chosen option).
-        When β < z -> μ = 𝒢(z, β) > pi/2, which means attraction towards the left side (currently mapped to distractor option).
-        So generally, higher β means more attraction towards target.
-        Note that μ ∈ (0,π], but when transformed to [0,1], it can represent the *probability* of navigating closer to distractor.
-    =#
-
-    #= NOTE FOR IMPROVEMENT:
-        In the current version, where I've remapped the chosen response to the right side and non-chosen to left,
-        μ represents the amount of competition or ambiguity. That is problematic, because the model has only a linear term
-        for the effect of VOT. But ambiguity is not linear over the VOT range; instead, we expect lower ambiguity towards either 
-        endpoint, and more ambiguity near the category boundary somewhere in the middle of the VOT range.
-        So to capture the expected pattern in the data, we would need to have a non-linear term for VOT, maybe quadratic
-
-        Maybe this isn't a problem if I go back to the original remapping with /b/ on the left and /p/ on the right...
-        In that case, μ would represent the attraction towards /b/ (left) vs /p/ (right). Then, we would expect μ to
-        be a monotonic function of VOT, where lower VOT means more attraction towards /b/ (left) and higher VOT means more attraction towards /p/ (right).
-        In that case, the linear term for VOT might be sufficient? 
-        Note that β < 0 shifts the curve to the left, meaning more attraction towards /b/ for a given z. 
-        So if η (the coefficient for VOT) then higher VOT -> higher β --> more attraction towards /p/ (right).
-        Pretty sure that all checks out, but leaving this note to remind myself to verify this later.
-        
-    =#
-
-    zₛₓₙ = Array{T}(undef, I, N);
-    
-    @inbounds for n in 1:N # Inner loop over timesteps
-        if n == 1
-            zₛₓₙ[:,n] ~ MvNormal(zeros(I), I)
-        else
-            zₛₓₙ[:,n] ~ MvNormal(zₛₓₙ[:,n-1], I)
-        end
-        μⱼₙ = 𝒢(zₛₓₙ[Sⱼ, n], βⱼ) 
-        Yⱼₓₙ[:, n] ~ arraydist(VonMises.(μⱼₙ, Kⱼₓₙ[:,n]))
-    end  
-    
-end
-
 @model function ssmod(
     S::AbstractVector{<:Integer}, # Length J, indexes the subject for trial j
     G::AbstractVector{<:Integer}, # Length J, indexes the language group of subject on trial j 
@@ -231,35 +167,24 @@ end
     N = size(Y, 2);
     J = size(Y, 1);
 
-    # Boundary shift per group
-    θ ~ MvNormal(zeros(n_groups), .25I)
-    Vc = V - θ[G]
+    #= Note: do I need to use absolute distance? 
+        Feels like for the DDM I could use signed distance, because the sign indicates direction of evidence accumulation.
+        But here, since β is a coefficient for the logistic function that determines attraction towards either response option,
+        it makes more sense to use absolute distance from the category boundary?
+    =#
 
-    # Global slope for VOT
-    η ~ Gamma(); # η = rand(Normal())
+    # Boundary for each group
+    θ ~ MvNormal(fill(10.0, n_groups), 5.0^2 * I)
+    ΔV = abs.(V - θ[G])
+
+    # Global slope for ΔV
+    η ~ Normal(0.0, 1.0); # η = rand(Normal())
 
     # VOT x Group interaction term
-    δ ~ MvNormal(zeros(n_groups-1), .5I) # δ = rand(MvNormal(zeros(n_groups-1), I))
+    δ ~ MvNormal(zeros(n_groups-1), 1.0^2 * I) # δ = rand(MvNormal(zeros(n_groups-1), I))
     δⱼ = (contrasts[G,:] * δ)
     
-    βⱼ = Vc .* (η .+ δⱼ)
-
-    #= MORE COMPLEX MODEL
-        # Boundary shift for each group
-        θₖ ~ MvNormal(zeros(n_groups), .5I)
-        Vcⱼ = Vⱼ .- θₖ[Gⱼ] # center VOT based on group boundary
-        η₂ ~ Normal(0, 0.5) # second-order polynomial term for VOT
-        δ₂ₖ ~ MvNormal(zeros(n_groups), 0.5I) # interaction term for polynomial
-        η₃ ~ Normal(0, 0.5) # second-order polynomial term for VOT
-        δ₃ₖ ~ MvNormal(zeros(n_groups), 0.5I) # interaction term for polynomial
-
-        # Predictor
-        βⱼ = @. γₖ[Gⱼ] + 
-            Vcⱼ * (η + δₖ[Gⱼ]) + 
-            (Vcⱼ^2) * (η₂ +  δ₂ₖ[Gⱼ]) +
-            (Vcⱼ^3) * (η₃ +  δ₃ₖ[Gⱼ])
-
-    =#
+    βⱼ = ΔV .* (η .+ δⱼ)
 
     ẑ = Matrix{T}(undef, n_subjects, N); ẑ[:, 1] .= zero(T)
     λ̂ = Matrix{T}(undef, n_subjects, N); λ̂[:, 1] .= one(T)
@@ -335,6 +260,8 @@ function plot_zMAP_subj(chn, S, G, V, s::Integer; N::Int=100, form=:logistic)
     η = mean(chn[:η])
     δ = contrasts[g, :]' * [mean(chn, "δ[$g]") for g in 1:2]
     #β = V .* (η + δ)
+
+    
 
     θ = mean(chn, "θ[$g]")
     Vc = abs.(V .- θ) # center VOT based on group boundary
